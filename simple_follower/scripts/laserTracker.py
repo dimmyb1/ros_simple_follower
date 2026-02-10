@@ -70,19 +70,22 @@ class LaserTracker(Node):
             return # Wait for next scan
 
         if minDistanceID is None or minDistance > scan_data.range_max:
-            # self.get_logger().warn('No object found') # Uncomment to debug
             msg = String()
             msg.data = 'laser:nothing found'
             self.infoPublisher.publish(msg)
         else:
-            minDistanceAngle = scan_data.angle_min + minDistanceID * scan_data.angle_increment
+            # Calculate angle
+            minDistanceAngle = scan_data.angle_min + (minDistanceID * scan_data.angle_increment)
             
-            # Publish Position
+            # Create message and explicitly cast to float
             msg = Position()
-            msg.angle_x = minDistanceAngle
-            msg.angle_y = 0.0 # Laser is 2D, no Y angle
-            msg.distance = minDistance
-            self.positionPublisher.publish(msg)
+            try:
+                msg.angle_x = float(minDistanceAngle)
+                msg.angle_y = 0.0
+                msg.distance = float(minDistance)
+                self.positionPublisher.publish(msg)
+            except Exception as e:
+                self.get_logger().error(f'Failed to publish position: {e}')
 
 def main(args=None):
     rclpy.init(args=args)
