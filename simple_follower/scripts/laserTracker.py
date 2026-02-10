@@ -1,85 +1,98 @@
-#!/usr/bin/env python
-# test mail: chutter@uos.de
-
-import rospy
-import thread, threading
-import time
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import numpy as np
-from sensor_msgs.msg import Joy, LaserScan
-from geometry_msgs.msg import Twist, Vector3
-from std_msgs.msg import String as StringMsg
-from simple_follower.msg import position as PositionMsg
-		
-class laserTracker:
-	def __init__(self):
-		self.lastScan=None
-		self.winSize = rospy.get_param('~winSize')
-		self.deltaDist = rospy.get_param('~deltaDist')
-		self.scanSubscriber = rospy.Subscriber('/hokuyo_base/scan', LaserScan, self.registerScan)
-		self.positionPublisher = rospy.Publisher('/object_tracker/current_position', PositionMsg,queue_size=3)
-		self.infoPublisher = rospy.Publisher('/object_tracker/info', StringMsg, queue_size=3)
+from sensor_msgs.msg import LaserScan
+from simple_follower.msg import Position
+from std_msgs.msg import String
 
-	def registerScan(self, scan_data):
-		# registers laser scan and publishes position of closest object (or point rather)
-		ranges = np.array(scan_data.ranges)
-		# sort by distance to check from closer to further away points if they might be something real
-		sortedIndices = np.argsort(ranges)
-		
-		minDistanceID = None
-		minDistance   = float('inf')		
+class LaserTracker(Node):
+    def __init__(self):
+        super().__init__('laser_tracker')
+        
+        # Parameters
+        self.winSize = 2
+        self.deltaDist = 0.2
+        self.lastScan = None
 
-		if(not(self.lastScan is None)):
-			# if we already have a last scan to compare to:
-			for i in sortedIndices:
-				# check all distance measurements starting from the closest one
-				tempMinDistance   = ranges[i]
-				
-				# now we check if this might be noise:
-				# get a window. in it we will check if there has been a scan with similar distance
-				# in the last scan within that window
-				
-				# we kneed to clip the window so we don't have an index out of bounds
-				windowIndex = np.clip([i-self.winSize, i+self.winSize+1],0,len(self.lastScan))
-				window = self.lastScan[windowIndex[0]:windowIndex[1]]
+        # QoS for sensor data (Best Effort is often used for LaserScan)
+        qos_policy = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
 
-				with np.errstate(invalid='ignore'):
-					# check if any of the scans in the window (in the last scan) has a distance close enough to the current one
-					if(np.any(abs(window-tempMinDistance)<=self.deltaDist)):
-					# this will also be false for all tempMinDistance = NaN or inf
+        # Subscribers and Publishers
+        self.subscriber = self.create_subscription(
+            LaserScan, 
+            '/scan', 
+            self.registerScan, 
+            qos_policy
+        )
+        self.positionPublisher = self.create_publisher(
+            Position, 
+            '/object_tracker/current_position', 
+            10
+        )
+        self.infoPublisher = self.create_publisher(
+            String, 
+            '/object_tracker/info', 
+            10
+        )
+        self.get_logger().info('Laser Tracker Started')
 
-						# we found a plausible distance
-						minDistanceID = i
-						minDistance = ranges[minDistanceID]
-						break # at least one point was equally close
-						# so we found a valid minimum and can stop the loop
-			
-		self.lastScan=ranges	
-		
-		#catches no scan, no minimum found, minimum is actually inf
-		if(minDistance > scan_data.range_max):
-			#means we did not really find a plausible object
-			
-			# publish warning that we did not find anything
-			rospy.logwarn('laser no object found')
-			self.infoPublisher.publish(StringMsg('laser:nothing found'))
-			
-		else:
-			# calculate angle of the objects location. 0 is straight ahead
-			minDistanceAngle = scan_data.angle_min + minDistanceID * scan_data.angle_increment
-			# here we only have an x angle, so the y is set arbitrarily
-			self.positionPublisher.publish(PositionMsg(minDistanceAngle, 42, minDistance))
-			
+    def registerScan(self, scan_data):
+        ranges = np.array(scan_data.ranges)
+        # Filter infinite values
+        ranges = np.where(np.isinf(ranges), scan_data.range_max, ranges)
+        
+        sortedIndices = np.argsort(ranges)
+        minDistanceID = None
+        minDistance = float('inf')
 
+        if self.lastScan is not None:
+            for i in sortedIndices:
+                tempMinDistance = ranges[i]
+                # Boundary checks for window
+                min_idx = max(0, i - self.winSize)
+                max_idx = min(len(self.lastScan), i + self.winSize + 1)
+                
+                window = self.lastScan[min_idx:max_idx]
+                
+                if np.any(np.abs(window - tempMinDistance) <= self.deltaDist):
+                    minDistanceID = i
+                    minDistance = ranges[minDistanceID]
+                    break
+            self.lastScan = ranges
+        else:
+            self.lastScan = ranges
+            return # Wait for next scan
 
+        if minDistanceID is None or minDistance > scan_data.range_max:
+            # self.get_logger().warn('No object found') # Uncomment to debug
+            msg = String()
+            msg.data = 'laser:nothing found'
+            self.infoPublisher.publish(msg)
+        else:
+            minDistanceAngle = scan_data.angle_min + minDistanceID * scan_data.angle_increment
+            
+            # Publish Position
+            msg = Position()
+            msg.angle_x = minDistanceAngle
+            msg.angle_y = 0.0 # Laser is 2D, no Y angle
+            msg.distance = minDistance
+            self.positionPublisher.publish(msg)
+
+def main(args=None):
+    rclpy.init(args=args)
+    tracker = LaserTracker()
+    try:
+        rclpy.spin(tracker)
+    except KeyboardInterrupt:
+        pass
+    tracker.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
-	print('starting')
-	rospy.init_node('laser_tracker')
-	tracker = laserTracker()
-	print('seems to do something')
-	try:
-		rospy.spin()
-	except rospy.ROSInterruptException:
-		print('exception')
-
-
+    main()

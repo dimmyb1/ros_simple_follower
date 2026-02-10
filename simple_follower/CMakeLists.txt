@@ -20,9 +20,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 # Install Python scripts
 install(PROGRAMS
-  simple_follower/scripts/laserTracker.py
-  simple_follower/scripts/visualTracker.py
-  simple_follower/scripts/follower.py
+  scripts/laserTracker.py
+  scripts/visualTracker.py
+  scripts/follower.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

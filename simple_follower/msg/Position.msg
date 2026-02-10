@@ -1,3 +1,3 @@
-float32 angleX
-float32 angleY
+float32 angle_x
+float32 angle_y
 float32 distance
