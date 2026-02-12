@@ -18,6 +18,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   DEPENDENCIES std_msgs
 )
 
+
+
 # Install Python scripts
 install(PROGRAMS
   scripts/laserTracker.py
@@ -31,5 +33,5 @@ install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME}
 )
-
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()

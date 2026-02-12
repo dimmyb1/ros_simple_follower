@@ -1,206 +1,178 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-from __future__ import division
-import rospy
-import message_filters
-import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 import cv2
-from matplotlib import pyplot as plt
-from cv_bridge import CvBridge 
+import numpy as np
+from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import Image, CameraInfo
+# Assuming the custom message is in the same package 'simple_follower'
+# If the package name in CMakeLists.txt is different, change this line.
+from simple_follower.msg import Position
 
-from sensor_msgs.msg import Image
-from simple_follower.msg import position as PositionMsg
-from std_msgs.msg import String as StringMsg
-np.seterr(all='raise')  
-displayImage=False
+class VisualTracker(Node):
+    def __init__(self):
+        super().__init__('visual_tracker')
 
-plt.close('all')
-class visualTracker:
-	def __init__(self):
-		self.bridge = CvBridge()
-		self.targetUpper = np.array(rospy.get_param('~target/upper'))
-		self.targetLower = np.array(rospy.get_param('~target/lower'))
-		self.pictureHeight= rospy.get_param('~pictureDimensions/pictureHeight')
-		self.pictureWidth = rospy.get_param('~pictureDimensions/pictureWidth')
-		vertAngle =rospy.get_param('~pictureDimensions/verticalAngle')
-		horizontalAngle =  rospy.get_param('~pictureDimensions/horizontalAngle')
-		# precompute tangens since thats all we need anyways:
-		self.tanVertical = np.tan(vertAngle)
-		self.tanHorizontal = np.tan(horizontalAngle)
-		
-		self.lastPosition =None
+        # --- Parameters ---
+        # Declare parameters so they can be changed from launch files
+        self.declare_parameter('target_hue_min', 0)
+        self.declare_parameter('target_hue_max', 10) # Red-ish by default
+        self.declare_parameter('camera_topic_rgb', '/camera/rgb/image_raw')
+        self.declare_parameter('camera_topic_depth', '/camera/depth/image_raw')
+        self.declare_parameter('camera_info_topic', '/camera/rgb/camera_info')
+       
+        # --- Variables ---
+        self.bridge = CvBridge()
+        self.latest_depth_image = None
+        self.camera_fov_horizontal = 60.0  # Default fallback (degrees)
+        self.image_width = 640 # Default fallback
+       
+        # --- Subscribers ---
+        # We use qos_profile_sensor_data (Best Effort) to match standard camera drivers
+       
+        # 1. Camera Info (to get FOV and width automatically)
+        self.create_subscription(
+            CameraInfo,
+            self.get_parameter('camera_info_topic').value,
+            self.camera_info_callback,
+            10
+        )
 
-		# one callback that deals with depth and rgb at the same time
-		im_sub = message_filters.Subscriber('/orbbec_astra/rgb/image_rect_color', Image)
-		dep_sub = message_filters.Subscriber('/orbbec_astra/depth/image', Image)
-		self.timeSynchronizer = message_filters.ApproximateTimeSynchronizer([im_sub, dep_sub], 10, 0.5)
-		self.timeSynchronizer.registerCallback(self.trackObject)
+        # 2. RGB Image
+        self.create_subscription(
+            Image,
+            self.get_parameter('camera_topic_rgb').value,
+            self.rgb_callback,
+            qos_profile_sensor_data
+        )
 
+        # 3. Depth Image
+        self.create_subscription(
+            Image,
+            self.get_parameter('camera_topic_depth').value,
+            self.depth_callback,
+            qos_profile_sensor_data
+        )
 
-		self.positionPublisher = rospy.Publisher('/object_tracker/current_position', PositionMsg, queue_size=3)
-		self.infoPublisher = rospy.Publisher('/object_tracker/info', StringMsg, queue_size=3)
-		rospy.logwarn(self.targetUpper)
+        # --- Publishers ---
+        self.position_publisher = self.create_publisher(
+            Position,
+            '/object_tracker/current_position',
+            10
+        )
+       
+        # Debug publisher (publishes the mask to see what the robot sees)
+        self.debug_publisher = self.create_publisher(
+            Image,
+            '/object_tracker/debug_view',
+            10
+        )
 
+        self.get_logger().info("Visual Tracker Node Started (ROS 2)")
 
-	def trackObject(self, image_data, depth_data):
-		if(image_data.encoding != 'rgb8'):
-			raise ValueError('image is not rgb8 as expected')
+    def camera_info_callback(self, msg):
+        # Calculate horizontal FOV from CameraInfo K matrix (fx)
+        # FOV = 2 * arctan(width / (2 * fx))
+        self.image_width = msg.width
+        fx = msg.k[0]
+        if fx > 0:
+            self.camera_fov_horizontal = 2 * np.arctan(msg.width / (2 * fx)) * (180 / np.pi)
 
-		#convert both images to numpy arrays
-		frame = self.bridge.imgmsg_to_cv2(image_data, desired_encoding='rgb8')
-		depthFrame = self.bridge.imgmsg_to_cv2(depth_data, desired_encoding='passthrough')#"32FC1")
+    def depth_callback(self, data):
+        try:
+            # Convert ROS Image message to OpenCV image
+            # 'passthrough' preserves the 16UC1 or 32FC1 encoding
+            self.latest_depth_image = self.bridge.imgmsg_to_cv2(data, desired_encoding='passthrough')
+        except CvBridgeError as e:
+            self.get_logger().error(f"Depth conversion error: {e}")
 
-		if(np.shape(frame)[0:2] != (self.pictureHeight, self.pictureWidth)):
-			raise ValueError('image does not have the right shape. shape(frame): {}, shape parameters:{}'.format(np.shape(frame)[0:2], (self.pictureHeight, self.pictureWidth)))
+    def rgb_callback(self, data):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        except CvBridgeError as e:
+            self.get_logger().error(f"RGB conversion error: {e}")
+            return
 
-		# blure a little and convert to HSV color space
-		blurred = cv2.GaussianBlur(frame, (11,11), 0)
-		hsv = cv2.cvtColor(blurred, cv2.COLOR_RGB2HSV)
-		
-		# select all the pixels that are in the range specified by the target
-		org_mask = cv2.inRange(hsv, self.targetUpper, self.targetLower)	
+        # 1. Convert to HSV
+        hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
 
-		# clean that up a little, the iterations are pretty much arbitrary
-		mask = cv2.erode(org_mask, None, iterations=4)
-		mask = cv2.dilate(mask,None, iterations=3)
-		
-		# find contours of the object
-		contours = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
-		newPos = None #if no contour at all was found the last position will again be set to none
+        # 2. Define Range of color to track (Get from params)
+        hue_min = self.get_parameter('target_hue_min').value
+        hue_max = self.get_parameter('target_hue_max').value
+       
+        # Standard HSV saturation/value limits for robust color detection
+        lower_limit = np.array([hue_min, 100, 100])
+        upper_limit = np.array([hue_max, 255, 255])
 
-		# lets you display the image for debuging. Not in realtime though
-		if displayImage:
-			backConverted = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-			#cv2.imshow('frame', backConverted)
-			#cv2.waitKey(0)
-			#print(backConverted)
-			plt.figure()
-			plt.subplot(2,2,1)
-			plt.imshow(frame)
-			plt.xticks([]),plt.yticks([])
-			plt.subplot(2,2,2)
-			plt.imshow(org_mask, cmap='gray', interpolation = 'bicubic')
-			plt.xticks([]),plt.yticks([])
-			plt.subplot(2,2,3)
-			plt.imshow(mask, cmap='gray', interpolation = 'bicubic')
-			plt.xticks([]),plt.yticks([])
-			plt.show()
-			rospy.sleep(0.2)
+        # 3. Create Mask
+        mask = cv2.inRange(hsv_image, lower_limit, upper_limit)
 
-		# go threw all the contours. starting with the bigest one
-		for contour in sorted(contours, key=cv2.contourArea, reverse=True):
-			# get position of object for this contour
-		 	pos = self.analyseContour(contour, depthFrame)
+        # 4. Find Contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-			# if it's the first one we found it will be the fall back for the next scan if we don't find a plausible one
-			if newPos is None:
-				newPos = pos
-			
-			# check if the position is plausible
-			if self.checkPosPlausible(pos):
-				self.lastPosition = pos
-				self.publishPosition(pos)
-				return
+        if len(contours) > 0:
+            # Find the largest contour (assuming it's the target)
+            c = max(contours, key=cv2.contourArea)
+           
+            # Get bounding box or moments
+            M = cv2.moments(c)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
 
-		self.lastPosition = newPos #we didn't find a plossible last position, so we just save the biggest contour 
-		# and publish warnings
-		rospy.loginfo('no position found')
-		self.infoPublisher.publish(StringMsg('visual:nothing found'))
+                # 5. Get Depth at Centroid
+                distance = 0.0
+                if self.latest_depth_image is not None:
+                    try:
+                        # Handle bounds check
+                        d_y = min(max(cy, 0), self.latest_depth_image.shape[0]-1)
+                        d_x = min(max(cx, 0), self.latest_depth_image.shape[1]-1)
+                       
+                        raw_dist = self.latest_depth_image[d_y, d_x]
+                       
+                        # Handle different depth encodings (mm vs meters)
+                        # Usually 16UC1 is mm, 32FC1 is meters.
+                        if isinstance(raw_dist, np.uint16):
+                            distance = raw_dist / 1000.0
+                        else:
+                            distance = float(raw_dist)
+                           
+                    except IndexError:
+                        pass
+               
+                # 6. Calculate Angle
+                # Map x pixel (0 to width) to angle (-FOV/2 to +FOV/2)
+                # 0 degrees is center of image
+                angle = (cx - (self.image_width/2)) * (self.camera_fov_horizontal / self.image_width)
+               
+                # 7. Publish
+                msg = Position()
+                msg.angleX = float(angle)
+                msg.angleY = 0.0 # Not calculated
+                msg.distance = float(distance)
+                self.position_publisher.publish(msg)
 
-			
-			
-			
+                # Draw circle on debug image
+                cv2.circle(cv_image, (cx, cy), 10, (0, 255, 0), 2)
 
-	def publishPosition(self, pos):
-		# calculate the angles from the raw position
-		angleX = self.calculateAngleX(pos)
-		angleY = self.calculateAngleY(pos)
-		# publish the position (angleX, angleY, distance)
-		posMsg = PositionMsg(angleX, angleY, pos[1])
-		self.positionPublisher.publish(posMsg)
+        # Publish debug image
+        try:
+            self.debug_publisher.publish(self.bridge.cv2_to_imgmsg(cv_image, "bgr8"))
+        except CvBridgeError:
+            pass
 
-	def checkPosPlausible(self, pos):
-		'''Checks if a position is plausible. i.e. close enough to the last one.'''
-
-		# for the first scan we cant tell
-		if self.lastPosition is None:
-			return False
-
-		# unpack positions
-		((centerX, centerY), dist)=pos	
-		((PcenterX, PcenterY), Pdist)=self.lastPosition
-		
-		if np.isnan(dist):
-			return False
-
-		# distance changed to much
-		if abs(dist-Pdist)>0.5:
-			return False
-
-		# location changed to much (5 is arbitrary)
-		if abs(centerX-PcenterX)>(self.pictureWidth /5):
-			return False
-
-		if abs(centerY-PcenterY)>(self.pictureHeight/5):
-			return False
-		
-		return True
-				
-		
-	def calculateAngleX(self, pos):
-		'''calculates the X angle of displacement from straight ahead'''
-
-		centerX = pos[0][0]
-		displacement = 2*centerX/self.pictureWidth-1
-		angle = -1*np.arctan(displacement*self.tanHorizontal)
-		return angle
-
-	def calculateAngleY(self, pos):
-		centerY = pos[0][1]
-		displacement = 2*centerY/self.pictureHeight-1
-		angle = -1*np.arctan(displacement*self.tanVertical)
-		return angle
-
-	def analyseContour(self, contour, depthFrame):
-		'''Calculates the centers coordinates and distance for a given contour
-
-		Args:
-			contour (opencv contour): contour of the object
-			depthFrame (numpy array): the depth image
-		
-		Returns:
-			centerX, centerY (doubles): center coordinates
-			averageDistance : distance of the object
-		'''
-		# get a rectangle that completely contains the object
-		centerRaw, size, rotation = cv2.minAreaRect(contour)
-
-		# get the center of that rounded to ints (so we can index the image)
-		center = np.round(centerRaw).astype(int)
-
-		# find out how far we can go in x/y direction without leaving the object (min of the extension of the bounding rectangle/2 (here 3 for safety)) 
-		minSize = int(min(size)/3)
-
-		# get all the depth points within this area (that is within the object)
-		depthObject = depthFrame[(center[1]-minSize):(center[1]+minSize), (center[0]-minSize):(center[0]+minSize)]
-
-		# get the average of all valid points (average to have a more reliable distance measure)
-		depthArray = depthObject[~np.isnan(depthObject)]
-		averageDistance = np.mean(depthArray)
-
-		if len(depthArray) == 0:
-			rospy.logwarn('empty depth array. all depth values are nan')
-
-		return (centerRaw, averageDistance)
-		
+def main(args=None):
+    rclpy.init(args=args)
+    tracker = VisualTracker()
+    try:
+        rclpy.spin(tracker)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tracker.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
-        print('starting')
-        rospy.init_node('visual_tracker')
-	tracker=visualTracker()
-        print('seems to do something')
-        try:
-                rospy.spin()
-        except rospy.ROSInterruptException:
-                print('exception')
-
+    main()
